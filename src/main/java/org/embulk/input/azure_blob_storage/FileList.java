@@ -3,11 +3,12 @@ package org.embulk.input.azure_blob_storage;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.google.common.base.Throwables;
-import org.embulk.config.Config;
-import org.embulk.config.ConfigDefault;
+
 import org.embulk.config.ConfigSource;
+import org.embulk.spi.DataException;
 import org.embulk.spi.Exec;
+import org.embulk.util.config.Config;
+import org.embulk.util.config.ConfigDefault;
 import org.slf4j.Logger;
 
 import java.io.BufferedInputStream;
@@ -36,6 +37,8 @@ public class FileList
         @Config("path_match_pattern")
         @ConfigDefault("\".*\"")
         String getPathMatchPattern();
+
+        void setPathMatchPattern(String pathMatchPattern);
 
         @Config("total_file_count_limit")
         @ConfigDefault("2147483647")
@@ -111,7 +114,7 @@ public class FileList
                 stream = new BufferedOutputStream(new GZIPOutputStream(binary));
             }
             catch (IOException ex) {
-                throw Throwables.propagate(ex);
+                throw new RuntimeException("Fail to create BufferedOutputStream", ex);
             }
         }
 
@@ -145,6 +148,7 @@ public class FileList
 
         // returns true if this file is used
         public synchronized boolean add(String path, long size)
+            throws IOException
         {
             // TODO throw IllegalStateException if stream is already closed
 
@@ -167,7 +171,7 @@ public class FileList
                 stream.write(data);
             }
             catch (IOException ex) {
-                throw Throwables.propagate(ex);
+                throw ex;
             }
 
             last = path;
@@ -180,7 +184,7 @@ public class FileList
                 stream.close();
             }
             catch (IOException ex) {
-                throw Throwables.propagate(ex);
+                throw new RuntimeException("Fail to close stream with error ", ex);
             }
             return new FileList(binary.toByteArray(), getSplits(entries), Optional.ofNullable(last));
         }
@@ -282,7 +286,7 @@ public class FileList
                 this.stream = new BufferedInputStream(new GZIPInputStream(new ByteArrayInputStream(data)));
             }
             catch (IOException ex) {
-                throw Throwables.propagate(ex);
+                throw new DataException("Fail to create Entry List " + ex.getMessage());
             }
             this.current = 0;
         }
@@ -298,7 +302,7 @@ public class FileList
                     stream = new BufferedInputStream(new GZIPInputStream(new ByteArrayInputStream(data)));
                 }
                 catch (IOException ex) {
-                    throw Throwables.propagate(ex);
+                    throw new DataException("Fail to create stream data, " + ex.getMessage());
                 }
                 current = 0;
             }
@@ -329,7 +333,7 @@ public class FileList
                 return b;
             }
             catch (IOException ex) {
-                throw Throwables.propagate(ex);
+                throw new DataException(ex);
             }
         }
 

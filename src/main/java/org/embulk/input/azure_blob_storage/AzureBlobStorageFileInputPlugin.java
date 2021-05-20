@@ -1,7 +1,6 @@
 package org.embulk.input.azure_blob_storage;
 
 import com.google.common.base.Charsets;
-import com.google.common.base.Throwables;
 import com.google.common.io.BaseEncoding;
 import com.microsoft.azure.storage.CloudStorageAccount;
 import com.microsoft.azure.storage.ResultContinuation;
@@ -12,25 +11,29 @@ import com.microsoft.azure.storage.blob.CloudBlob;
 import com.microsoft.azure.storage.blob.CloudBlobClient;
 import com.microsoft.azure.storage.blob.CloudBlobContainer;
 import com.microsoft.azure.storage.blob.ListBlobItem;
-import org.embulk.config.Config;
-import org.embulk.config.ConfigDefault;
+
 import org.embulk.config.ConfigDiff;
 import org.embulk.config.ConfigException;
-import org.embulk.config.ConfigInject;
 import org.embulk.config.ConfigSource;
-import org.embulk.config.Task;
 import org.embulk.config.TaskReport;
 import org.embulk.config.TaskSource;
-import org.embulk.spi.BufferAllocator;
+import org.embulk.spi.DataException;
 import org.embulk.spi.Exec;
 import org.embulk.spi.FileInputPlugin;
 import org.embulk.spi.TransactionalFileInput;
-import org.embulk.spi.util.InputStreamFileInput;
-import org.embulk.spi.util.InputStreamFileInput.InputStreamWithHints;
-import org.embulk.spi.util.RetryExecutor.RetryGiveupException;
-import org.embulk.spi.util.RetryExecutor.Retryable;
+
+import org.embulk.util.config.Config;
+import org.embulk.util.config.ConfigDefault;
+import org.embulk.util.config.ConfigMapper;
+import org.embulk.util.config.ConfigMapperFactory;
+import org.embulk.util.config.Task;
+import org.embulk.util.file.InputStreamFileInput;
+import org.embulk.util.file.InputStreamFileInput.InputStreamWithHints;
+import org.embulk.util.retryhelper.RetryExecutor;
+import org.embulk.util.retryhelper.RetryGiveupException;
+import org.embulk.util.retryhelper.Retryable;
 import org.slf4j.Logger;
-import static org.embulk.spi.util.RetryExecutor.retryExecutor;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
@@ -75,32 +78,35 @@ public class AzureBlobStorageFileInputPlugin
 
         FileList getFiles();
         void setFiles(FileList files);
-
-        @ConfigInject
-        BufferAllocator getBufferAllocator();
     }
 
-    private static final Logger log = Exec.getLogger(AzureBlobStorageFileInputPlugin.class);
+    private static final Logger log = LoggerFactory.getLogger(AzureBlobStorageFileInputPlugin.class);
 
     private static boolean IS_REMOVE_FIRST_RECORD = true;
+
+    public static final ConfigMapperFactory CONFIG_MAPPER_FACTORY = ConfigMapperFactory
+        .builder()
+        .addDefaultModules()
+        .build();
+    public static final ConfigMapper CONFIG_MAPPER = CONFIG_MAPPER_FACTORY.createConfigMapper();
 
     @Override
     public ConfigDiff transaction(ConfigSource config, FileInputPlugin.Control control)
     {
-        final PluginTask task = config.loadConfig(PluginTask.class);
+        final PluginTask task = CONFIG_MAPPER.map(config, PluginTask.class);
 
         task.setFiles(listFiles(task));
 
-        return resume(task.dump(), task.getFiles().getTaskCount(), control);
+        return resume(task.toTaskSource(), task.getFiles().getTaskCount(), control);
     }
 
     @Override
     public ConfigDiff resume(TaskSource taskSource, int taskCount, FileInputPlugin.Control control)
     {
-        PluginTask task = taskSource.loadTask(PluginTask.class);
+        PluginTask task = CONFIG_MAPPER_FACTORY.createTaskMapper().map(taskSource, PluginTask.class);
         control.run(taskSource, taskCount);
 
-        ConfigDiff configDiff = Exec.newConfigDiff();
+        ConfigDiff configDiff = CONFIG_MAPPER_FACTORY.newConfigDiff();
         if (task.getIncremental()) {
             configDiff.set("last_path", task.getFiles().getLastPath(task.getLastPath()));
         }
@@ -146,11 +152,11 @@ public class AzureBlobStorageFileInputPlugin
     {
         final String lastKey = (lastPath.isPresent() && !lastPath.get().isEmpty()) ? createNextToken(lastPath.get()) : null;
         try {
-            return retryExecutor()
+            return RetryExecutor.builder()
                     .withRetryLimit(maxConnectionRetry)
-                    .withInitialRetryWait(500)
-                    .withMaxRetryWait(30 * 1000)
-                    .runInterruptible(new Retryable<FileList>() {
+                    .withInitialRetryWaitMillis(500)
+                    .withMaxRetryWaitMillis(30 * 1000)
+                    .build().runInterruptible(new Retryable<FileList>() {
                         @Override
                         public FileList call() throws StorageException, URISyntaxException, IOException
                         {
@@ -214,18 +220,15 @@ public class AzureBlobStorageFileInputPlugin
                         }
                     });
         }
-        catch (RetryGiveupException ex) {
-            throw Throwables.propagate(ex.getCause());
-        }
-        catch (InterruptedException ex) {
-            throw Throwables.propagate(ex);
+        catch (RetryGiveupException | InterruptedException ex) {
+            throw new DataException(ex.getCause());
         }
     }
 
     @Override
     public TransactionalFileInput open(TaskSource taskSource, int taskIndex)
     {
-        PluginTask task = taskSource.loadTask(PluginTask.class);
+        PluginTask task = CONFIG_MAPPER_FACTORY.createTaskMapper().map(taskSource, PluginTask.class);
         return new AzureFileInput(task, taskIndex);
     }
 
@@ -235,13 +238,13 @@ public class AzureBlobStorageFileInputPlugin
     {
         public AzureFileInput(PluginTask task, int taskIndex)
         {
-            super(task.getBufferAllocator(), new SingleFileProvider(task, taskIndex));
+            super(Exec.getBufferAllocator(), new SingleFileProvider(task, taskIndex));
         }
         public void abort() {}
 
         public TaskReport commit()
         {
-            return Exec.newTaskReport();
+            return CONFIG_MAPPER_FACTORY.newTaskReport();
         }
 
         @Override
@@ -274,17 +277,17 @@ public class AzureBlobStorageFileInputPlugin
             final String key = iterator.next();
             opened = true;
             try {
-                return retryExecutor()
-                        .withRetryLimit(maxConnectionRetry)
-                        .withInitialRetryWait(500)
-                        .withMaxRetryWait(30 * 1000)
-                        .runInterruptible(new Retryable<InputStreamWithHints>() {
+                return  RetryExecutor.builder()
+                    .withRetryLimit(maxConnectionRetry)
+                    .withInitialRetryWaitMillis(500)
+                    .withMaxRetryWaitMillis(30 * 1000)
+                    .build().runInterruptible(new Retryable<InputStreamWithHints>() {
                             @Override
-                            public InputStreamWithHints call() throws StorageException, URISyntaxException, IOException
+                            public InputStreamFileInput.InputStreamWithHints call() throws StorageException, URISyntaxException, IOException
                             {
                                 CloudBlobContainer container = client.getContainerReference(containerName);
                                 CloudBlob blob = container.getBlockBlobReference(key);
-                                return new InputStreamWithHints(
+                                return new InputStreamFileInput.InputStreamWithHints(
                                         blob.openInputStream(),
                                         String.format("%s/%s", containerName, key)
                                 );
@@ -317,11 +320,8 @@ public class AzureBlobStorageFileInputPlugin
                             }
                         });
             }
-            catch (RetryGiveupException ex) {
-                throw Throwables.propagate(ex.getCause());
-            }
-            catch (InterruptedException ex) {
-                throw Throwables.propagate(ex);
+            catch (RetryGiveupException | InterruptedException ex) {
+                throw new DataException(ex);
             }
         }
 
